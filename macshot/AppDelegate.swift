@@ -220,6 +220,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private var statusBarMenu: NSMenu?
     private var captureSessionID: UInt = 0
     private var captureTimingTrace: CaptureTimingTrace?
+    /// Launch Services can deliver file/URL open requests before
+    /// `applicationDidFinishLaunching`. Defer them until launch setup and the
+    /// initial overlay-pool prewarm have completed; otherwise a cold-launch
+    /// capture can be torn down by `rebuildOverlayPool()` later in startup.
+    private var isReadyForOpenRequests = false
+    private var pendingOpenURLs: [URL] = []
+    /// Capture/record URL actions additionally wait for Screen Recording
+    /// permission. Non-capture actions (settings, history, file opens, etc.)
+    /// remain usable while the onboarding window is shown.
+    private var isReadyForScreenCaptureURLs = false
+    private var pendingScreenCaptureURLs: [URL] = []
     /// App Nap suppression assertion. Held for the app's lifetime so global
     /// hotkeys respond instantly instead of paying a wake-up penalty when
     /// macshot has been idle. Use the idle-sleep-safe variant: plain
@@ -338,10 +349,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         PermissionOnboardingController.checkPermissionSync { [weak self] granted in
             guard let self = self else { return }
             if granted {
-                self.prewarmCapturePath()
+                self.markScreenCaptureURLsReady()
             } else {
                 self.showOnboarding()
             }
+        }
+
+        // Replay requests on the next run-loop turn so AppKit has completely
+        // finished its launch lifecycle before an action presents UI or starts
+        // a capture. Keep accepting requests into the queue until this runs so
+        // their delivery order is preserved.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.isReadyForOpenRequests = true
+            let urls = self.pendingOpenURLs
+            self.pendingOpenURLs.removeAll()
+            self.handleOpenURLs(urls)
         }
     }
 
@@ -353,11 +376,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         }
         let oc = PermissionOnboardingController()
         oc.onPermissionGranted = { [weak self] in
-            self?.onboardingController = nil
-            self?.prewarmCapturePath()
+            guard let self = self else { return }
+            self.onboardingController = nil
+            self.markScreenCaptureURLsReady()
         }
         oc.onClose = { [weak self, weak oc] in
-            if self?.onboardingController === oc { self?.onboardingController = nil }
+            guard let self = self, self.onboardingController === oc else { return }
+            self.onboardingController = nil
+            // Closing onboarding abandons any action that was waiting for its
+            // permission; never surprise the user by replaying it much later.
+            self.pendingScreenCaptureURLs.removeAll()
         }
         onboardingController = oc
         oc.show()
@@ -371,6 +399,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         // than creating fresh. This is what keeps captures fast — WindowServer
         // caches composition state per-window, and reused windows stay hot.
         rebuildOverlayPool()
+    }
+
+    private func markScreenCaptureURLsReady() {
+        guard !isReadyForScreenCaptureURLs else { return }
+        // Do not rebuild underneath a capture started through another entry
+        // point. A later capture can create any missing pooled controller on
+        // demand.
+        if !isCapturing && recordingEngine == nil {
+            prewarmCapturePath()
+        }
+        isReadyForScreenCaptureURLs = true
+        let urls = pendingScreenCaptureURLs
+        pendingScreenCaptureURLs.removeAll()
+        handleOpenURLs(urls)
     }
 
     /// Persistent per-screen overlay controller pool. Held for the app's
@@ -540,7 +582,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
             // Relaunch from /Applications
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            task.arguments = ["-n", dest.path]
+            // Preserve any cold-launch request that arrived before the user
+            // accepted this move prompt. `-a` makes the copied bundle the
+            // explicit recipient of both custom URLs and file URLs.
+            task.arguments = ["-n", "-a", dest.path]
+                + pendingOpenURLs.map(\.absoluteString)
             try task.run()
             NSApp.terminate(nil)
         } catch {
@@ -2207,12 +2253,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
     /// Handle files opened via Finder "Open With", drag-to-dock, or command line.
     func application(_ application: NSApplication, open urls: [URL]) {
+        guard isReadyForOpenRequests else {
+            pendingOpenURLs.append(contentsOf: urls)
+            return
+        }
+        handleOpenURLs(urls)
+    }
+
+    private func handleOpenURLs(_ urls: [URL]) {
         let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "tiff", "tif", "bmp", "gif", "heic", "heif", "webp", "icns"]
         let videoExtensions: Set<String> = ["mp4", "mov", "m4v"]
         for url in urls {
             if url.scheme == "macshot" {
                 let urlSchemeEnabled = UserDefaults.standard.object(forKey: "urlSchemeEnabled") as? Bool ?? true
                 guard urlSchemeEnabled else { continue }
+                if Self.screenCaptureURLActions.contains(url.host ?? "") {
+                    if !isReadyForScreenCaptureURLs,
+                       PermissionOnboardingController.hasScreenRecordingPermission() {
+                        markScreenCaptureURLsReady()
+                    }
+                    if !isReadyForScreenCaptureURLs {
+                        pendingScreenCaptureURLs.append(url)
+                        showOnboarding()
+                        continue
+                    }
+                }
                 handleURLSchemeAction(url)
                 continue
             }
@@ -2230,6 +2295,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
     /// Handle macshot:// URL scheme actions from external tools (Raycast, Alfred, etc.).
     /// Usage: `open macshot://capture`, `open macshot://ocr`, etc.
+    private static let screenCaptureURLActions: Set<String> = [
+        "capture", "capture-fullscreen", "capture-last", "quick-capture",
+        "ocr", "ocr-translate", "record", "record-fullscreen", "scroll-capture",
+    ]
+
     private func handleURLSchemeAction(_ url: URL) {
         guard let action = url.host else { return }
         switch action {
